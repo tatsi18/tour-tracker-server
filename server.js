@@ -15,7 +15,9 @@ const JWT_SECRET =
 // Middleware
 app.use(
   cors({
-    origin: "*",
+    origin: [
+      "https://tour-tracker-server.onrender.com",
+      "http://localhost:3000",,
     credentials: true,
   })
 );
