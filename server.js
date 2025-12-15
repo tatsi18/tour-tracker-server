@@ -18,6 +18,8 @@ app.use(
     origin: [
       "https://tour-tracker-server.onrender.com",
       "http://localhost:3000",
+      "https://tour-tracker-client.vercel.app" // <-- NO COMMA HERE if it's the last item in the array!
+    ], // <-- COMMA needed here to separate the origin array from the credentials property
     credentials: true,
   })
 );
