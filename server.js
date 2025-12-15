@@ -17,7 +17,7 @@ app.use(
   cors({
     origin: [
       "https://tour-tracker-server.onrender.com",
-      "http://localhost:3000",,
+      "http://localhost:3000",
     credentials: true,
   })
 );
