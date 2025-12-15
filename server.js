@@ -13,16 +13,14 @@ const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
 
 // Middleware
+
 app.use(
   cors({
-    origin: [
-      "https://tour-tracker-server.onrender.com",
-      "http://localhost:3000",
-      "https://tour-tracker-client.vercel.app" // <-- NO COMMA HERE if it's the last item in the array!
-    ], // <-- COMMA needed here to separate the origin array from the credentials property
+    origin: ["https://tour-tracker-client.vercel.app", "http://localhost:5173", "https://tour-tracker-server.onrender.com"],
     credentials: true,
   })
 );
+
 app.use(bodyParser.json());
 
 // PostgreSQL pool for Neon
