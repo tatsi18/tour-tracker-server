@@ -3,9 +3,27 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const { Pool } = require("pg");
+const pg = require("pg"); // <--- REQUIRED FOR DATE PARSER OVERRIDE
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 require("dotenv").config();
+
+// =========================================================================
+// 🛑 CRITICAL FIX: OVERRIDE PG DATE PARSING
+// =========================================================================
+// This forces the 'pg' library to return all TIMESTAMP and DATE types as
+// raw text strings instead of potentially corrupted or non-standard
+// JavaScript Date objects, which cause the client-side crash (blank page/no tours).
+pg.types.setTypeParser(pg.types.builtins.TIMESTAMP, function (stringValue) {
+  return stringValue;
+});
+pg.types.setTypeParser(pg.types.builtins.TIMESTAMPTZ, function (stringValue) {
+  return stringValue;
+});
+pg.types.setTypeParser(pg.types.builtins.DATE, function (stringValue) {
+  return stringValue;
+});
+// =========================================================================
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -13,10 +31,14 @@ const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
 
 // Middleware
-
 app.use(
   cors({
-    origin: ["https://tour-tracker-client.vercel.app", "http://localhost:5173", "https://tour-tracker-server.onrender.com"],
+    origin: [
+      "https://tour-tracker-client.vercel.app",
+      "http://localhost:5173",
+      "https://tour-tracker-server.onrender.com",
+      "null", // Add this to allow file:// protocol
+    ],
     credentials: true,
   })
 );
@@ -161,11 +183,54 @@ app.get("/api/auth/verify", authenticateToken, (req, res) => {
   res.json({ valid: true, user: req.user });
 });
 
-/* ----- TOUREVENTS ----- */
-// GET all events WITH JOINS to get agency names, colors, template names, ship names
-app.get("/api/events", async (req, res) => {
+// Reset password (add this after your login route)
+app.post("/api/auth/reset-password", async (req, res) => {
   try {
-    const result = await db.query(`
+    const { username, newPassword } = req.body;
+
+    if (!username || !newPassword) {
+      return res
+        .status(400)
+        .json({ error: "Username and new password are required" });
+    }
+
+    if (newPassword.length < 8) {
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 8 characters" });
+    }
+
+    // Check if user exists
+    const userResult = await db.query(
+      "SELECT user_id FROM users WHERE username = $1",
+      [username]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password
+    await db.query("UPDATE users SET password_hash = $1 WHERE username = $2", [
+      hashedPassword,
+      username,
+    ]);
+
+    res.json({ message: "Password reset successfully" });
+  } catch (err) {
+    console.error("Password reset error:", err);
+    res.status(500).json({ error: "Password reset failed" });
+  }
+});
+/* ----- TOUREVENTS ----- */
+// GET all events - NOW FILTERED BY USER
+app.get("/api/events", authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `
       SELECT 
         te.tour_id,
         te.custom_name,
@@ -185,36 +250,30 @@ app.get("/api/events", async (req, res) => {
       LEFT JOIN touragencies ta ON te.agency_id = ta.agency_id
       LEFT JOIN tourtemplates tt ON te.template_id = tt.template_id
       LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
+      WHERE te.user_id = $1
       ORDER BY te.tour_date, te.start_time
-    `);
+    `,
+      [req.user.userId]
+    );
 
-    console.log("Database query result:", result.rows);
+    const events = result.rows.map((event) => ({
+      id: event.tour_id,
+      title: event.custom_name || event.tour_type_name,
+      start: event.start_time, // This is now a simple string due to the parser override
+      end: event.end_time, // This is now a simple string due to the parser override
+      backgroundColor: event.agency_color_code || "#3788d8",
+      borderColor: event.agency_color_code || "#3788d8",
+      agency: event.agency_name,
+      cruiseShip: event.ship_name,
+      description: event.custom_name,
+      tourType: event.tour_type_name,
+      tipEUR: event.tip_eur,
+      tipUSD: event.tip_usd,
+      agencyId: event.agency_id,
+      templateId: event.template_id,
+      shipId: event.ship_id,
+    }));
 
-    // Transform for FullCalendar
-    const events = result.rows.map((event) => {
-      console.log(
-        `Event: ${event.custom_name}, Agency: ${event.agency_name}, Color: ${event.agency_color_code}`
-      );
-      return {
-        id: event.tour_id,
-        title: event.custom_name || event.tour_type_name,
-        start: event.start_time,
-        end: event.end_time,
-        backgroundColor: event.agency_color_code || "#3788d8",
-        borderColor: event.agency_color_code || "#3788d8",
-        agency: event.agency_name,
-        cruiseShip: event.ship_name,
-        description: event.custom_name,
-        tourType: event.tour_type_name,
-        tipEUR: event.tip_eur,
-        tipUSD: event.tip_usd,
-        agencyId: event.agency_id,
-        templateId: event.template_id,
-        shipId: event.ship_id,
-      };
-    });
-
-    console.log("Sending events to frontend:", events);
     res.json(events);
   } catch (err) {
     console.error("Database SELECT error:", err);
@@ -222,10 +281,11 @@ app.get("/api/events", async (req, res) => {
   }
 });
 
-// GET detailed tour data for reports
-app.get("/api/tours-detailed", async (req, res) => {
+// GET detailed tour data for reports - FILTERED BY USER
+app.get("/api/tours-detailed", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(`
+    const result = await db.query(
+      `
       SELECT 
         te.tour_id,
         te.custom_name,
@@ -247,8 +307,11 @@ app.get("/api/tours-detailed", async (req, res) => {
       LEFT JOIN touragencies ta ON te.agency_id = ta.agency_id
       LEFT JOIN tourtemplates tt ON te.template_id = tt.template_id
       LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
+      WHERE te.user_id = $1
       ORDER BY te.tour_date, te.start_time
-    `);
+    `,
+      [req.user.userId]
+    );
 
     res.json(result.rows);
   } catch (err) {
@@ -257,15 +320,12 @@ app.get("/api/tours-detailed", async (req, res) => {
   }
 });
 
-// Mark tours as paid for a specific month and agency
-app.post("/api/mark-month-paid", async (req, res) => {
+// Mark tours as paid - USER-SPECIFIC
+app.post("/api/mark-month-paid", authenticateToken, async (req, res) => {
   try {
     const { month, agencyId, isPaid } = req.body;
-
-    // Parse the Greek month format to get year and month number
     const [monthName, year] = month.split(" ");
 
-    // Greek month names to numbers
     const greekMonths = {
       Ιανουάριος: 1,
       Φεβρουάριος: 2,
@@ -287,15 +347,15 @@ app.post("/api/mark-month-paid", async (req, res) => {
       return res.status(400).json({ error: "Invalid month format" });
     }
 
-    // Update all tours for this agency in this month
     const result = await db.query(
       `UPDATE tourevents 
        SET payment_status = $1 
        WHERE agency_id = $2 
-       AND EXTRACT(MONTH FROM tour_date) = $3 
-       AND EXTRACT(YEAR FROM tour_date) = $4
+       AND user_id = $3
+       AND EXTRACT(MONTH FROM tour_date) = $4 
+       AND EXTRACT(YEAR FROM tour_date) = $5
        RETURNING *`,
-      [isPaid ? "Paid" : "Unpaid", agencyId, monthNum, year]
+      [isPaid ? "Paid" : "Unpaid", agencyId, req.user.userId, monthNum, year]
     );
 
     res.json({ success: true, updated: result.rowCount });
@@ -305,8 +365,8 @@ app.post("/api/mark-month-paid", async (req, res) => {
   }
 });
 
-// POST new event
-app.post("/api/events", async (req, res) => {
+// POST new event - INCLUDES USER_ID (Original simplified logic)
+app.post("/api/events", authenticateToken, async (req, res) => {
   try {
     const {
       custom_name,
@@ -323,7 +383,6 @@ app.post("/api/events", async (req, res) => {
     const startTimestamp = `${tour_date} ${start_time}:00`;
     const endTimestamp = `${tour_date} ${end_time}:00`;
 
-    // First, get the default_base_price from the template
     const templateResult = await db.query(
       "SELECT default_base_price FROM tourtemplates WHERE template_id = $1",
       [template_id]
@@ -333,8 +392,8 @@ app.post("/api/events", async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO tourevents
-       (custom_name, tour_date, start_time, end_time, agency_id, template_id, ship_id, base_price, payment_status, tip_eur, tip_usd)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+       (custom_name, tour_date, start_time, end_time, agency_id, template_id, ship_id, base_price, payment_status, tip_eur, tip_usd, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [
         custom_name,
         tour_date,
@@ -347,6 +406,7 @@ app.post("/api/events", async (req, res) => {
         "Unpaid",
         tip_eur,
         tip_usd,
+        req.user.userId,
       ]
     );
 
@@ -357,10 +417,28 @@ app.post("/api/events", async (req, res) => {
   }
 });
 
-// PUT update event - FIXED to handle tip_eur and tip_usd
-app.put("/api/events/:id", async (req, res) => {
+// PUT update event - CHECKS USER OWNERSHIP
+app.put("/api/events/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+
+    // 1. Verification of ownership
+    const checkResult = await db.query(
+      "SELECT user_id FROM tourevents WHERE tour_id = $1",
+      [id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: "Tour not found" });
+    }
+
+    // IMPORTANT: Check if the user_id is the same type (number vs string)
+    // The JWT stores user_id as a number, but req.user.userId is a string.
+    // Ensure strict type checking is avoided or conversion is used (e.g., toString()).
+    if (checkResult.rows[0].user_id.toString() !== req.user.userId.toString()) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
     const {
       custom_name,
       tour_date,
@@ -394,9 +472,6 @@ app.put("/api/events/:id", async (req, res) => {
       ]
     );
 
-    if (result.rowCount === 0)
-      return res.status(404).json({ error: "Event not found" });
-
     res.json(result.rows[0]);
   } catch (err) {
     console.error("PUT Event error:", err);
@@ -404,13 +479,13 @@ app.put("/api/events/:id", async (req, res) => {
   }
 });
 
-// DELETE event
-app.delete("/api/events/:id", async (req, res) => {
+// DELETE event - USER-SPECIFIC
+app.delete("/api/events/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
-      "DELETE FROM tourevents WHERE tour_id=$1 RETURNING *",
-      [id]
+      "DELETE FROM tourevents WHERE tour_id=$1 AND user_id=$2 RETURNING *",
+      [id, req.user.userId]
     );
 
     if (result.rowCount === 0)
@@ -423,9 +498,9 @@ app.delete("/api/events/:id", async (req, res) => {
   }
 });
 
-/* ----- TOURAGENCIES ----- */
-// GET all agencies
-app.get("/api/agencies", async (req, res) => {
+/* ----- AGENCIES, TEMPLATES, SHIPS (SHARED - AUTHENTICATED ACCESS ONLY) ----- */
+
+app.get("/api/agencies", authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
       "SELECT * FROM touragencies ORDER BY agency_id"
@@ -437,8 +512,7 @@ app.get("/api/agencies", async (req, res) => {
   }
 });
 
-// POST new agency
-app.post("/api/agencies", async (req, res) => {
+app.post("/api/agencies", authenticateToken, async (req, res) => {
   try {
     const { agency_name, agency_color_code, calculation_scenario } = req.body;
     const result = await db.query(
@@ -453,8 +527,7 @@ app.post("/api/agencies", async (req, res) => {
   }
 });
 
-// PUT update agency
-app.put("/api/agencies/:id", async (req, res) => {
+app.put("/api/agencies/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { agency_name, agency_color_code, calculation_scenario } = req.body;
@@ -473,8 +546,7 @@ app.put("/api/agencies/:id", async (req, res) => {
   }
 });
 
-// DELETE agency
-app.delete("/api/agencies/:id", async (req, res) => {
+app.delete("/api/agencies/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -490,9 +562,7 @@ app.delete("/api/agencies/:id", async (req, res) => {
   }
 });
 
-/* ----- TOURTEMPLATES ----- */
-// GET all templates
-app.get("/api/templates", async (req, res) => {
+app.get("/api/templates", authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
       "SELECT template_id, tour_type_name AS template_name, default_base_price FROM tourtemplates ORDER BY template_id"
@@ -504,8 +574,7 @@ app.get("/api/templates", async (req, res) => {
   }
 });
 
-// Alias for compatibility with SettingsPage
-app.get("/api/tourtypes", async (req, res) => {
+app.get("/api/tourtypes", authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
       "SELECT template_id as tour_type_id, tour_type_name as type_name, default_base_price as base_price FROM tourtemplates ORDER BY template_id"
@@ -517,8 +586,7 @@ app.get("/api/tourtypes", async (req, res) => {
   }
 });
 
-// POST new template
-app.post("/api/templates", async (req, res) => {
+app.post("/api/templates", authenticateToken, async (req, res) => {
   try {
     const { tour_type_name, default_base_price } = req.body;
     const result = await db.query(
@@ -533,8 +601,7 @@ app.post("/api/templates", async (req, res) => {
   }
 });
 
-// POST for tourtypes (alias)
-app.post("/api/tourtypes", async (req, res) => {
+app.post("/api/tourtypes", authenticateToken, async (req, res) => {
   try {
     const { type_name, base_price } = req.body;
     const result = await db.query(
@@ -549,8 +616,7 @@ app.post("/api/tourtypes", async (req, res) => {
   }
 });
 
-// PUT update template
-app.put("/api/templates/:id", async (req, res) => {
+app.put("/api/templates/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { tour_type_name, default_base_price } = req.body;
@@ -569,8 +635,7 @@ app.put("/api/templates/:id", async (req, res) => {
   }
 });
 
-// PUT for tourtypes (alias)
-app.put("/api/tourtypes/:id", async (req, res) => {
+app.put("/api/tourtypes/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { type_name, base_price } = req.body;
@@ -589,8 +654,7 @@ app.put("/api/tourtypes/:id", async (req, res) => {
   }
 });
 
-// DELETE template
-app.delete("/api/templates/:id", async (req, res) => {
+app.delete("/api/templates/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -606,8 +670,7 @@ app.delete("/api/templates/:id", async (req, res) => {
   }
 });
 
-// DELETE for tourtypes (alias)
-app.delete("/api/tourtypes/:id", async (req, res) => {
+app.delete("/api/tourtypes/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -623,9 +686,7 @@ app.delete("/api/tourtypes/:id", async (req, res) => {
   }
 });
 
-/* ----- CRUISESHIPS ----- */
-// GET all ships
-app.get("/api/ships", async (req, res) => {
+app.get("/api/ships", authenticateToken, async (req, res) => {
   try {
     const result = await db.query("SELECT * FROM cruiseships ORDER BY ship_id");
     res.json(result.rows);
@@ -635,8 +696,7 @@ app.get("/api/ships", async (req, res) => {
   }
 });
 
-// Alias for compatibility with SettingsPage
-app.get("/api/cruiseships", async (req, res) => {
+app.get("/api/cruiseships", authenticateToken, async (req, res) => {
   try {
     const result = await db.query("SELECT * FROM cruiseships ORDER BY ship_id");
     res.json(result.rows);
@@ -646,8 +706,7 @@ app.get("/api/cruiseships", async (req, res) => {
   }
 });
 
-// POST new ship
-app.post("/api/ships", async (req, res) => {
+app.post("/api/ships", authenticateToken, async (req, res) => {
   try {
     const { ship_name } = req.body;
     const result = await db.query(
@@ -661,8 +720,7 @@ app.post("/api/ships", async (req, res) => {
   }
 });
 
-// POST for cruiseships (alias)
-app.post("/api/cruiseships", async (req, res) => {
+app.post("/api/cruiseships", authenticateToken, async (req, res) => {
   try {
     const { ship_name } = req.body;
     const result = await db.query(
@@ -676,8 +734,7 @@ app.post("/api/cruiseships", async (req, res) => {
   }
 });
 
-// PUT update ship
-app.put("/api/ships/:id", async (req, res) => {
+app.put("/api/ships/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { ship_name } = req.body;
@@ -694,8 +751,7 @@ app.put("/api/ships/:id", async (req, res) => {
   }
 });
 
-// PUT for cruiseships (alias)
-app.put("/api/cruiseships/:id", async (req, res) => {
+app.put("/api/cruiseships/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { ship_name } = req.body;
@@ -712,8 +768,7 @@ app.put("/api/cruiseships/:id", async (req, res) => {
   }
 });
 
-// DELETE ship
-app.delete("/api/ships/:id", async (req, res) => {
+app.delete("/api/ships/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -729,8 +784,7 @@ app.delete("/api/ships/:id", async (req, res) => {
   }
 });
 
-// DELETE for cruiseships (alias)
-app.delete("/api/cruiseships/:id", async (req, res) => {
+app.delete("/api/cruiseships/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
