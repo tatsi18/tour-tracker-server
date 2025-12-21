@@ -3,17 +3,16 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
 const { Pool } = require("pg");
-const pg = require("pg"); // <--- REQUIRED FOR DATE PARSER OVERRIDE
+const pg = require("pg");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const webpush = require("web-push");
+const cron = require("node-cron");
 require("dotenv").config();
 
 // =========================================================================
 // 🛑 CRITICAL FIX: OVERRIDE PG DATE PARSING
 // =========================================================================
-// This forces the 'pg' library to return all TIMESTAMP and DATE types as
-// raw text strings instead of potentially corrupted or non-standard
-// JavaScript Date objects, which cause the client-side crash (blank page/no tours).
 pg.types.setTypeParser(pg.types.builtins.TIMESTAMP, function (stringValue) {
   return stringValue;
 });
@@ -30,6 +29,19 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
 
+// Configure web-push with VAPID keys (only if keys are provided)
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    process.env.VAPID_EMAIL || "mailto:example@yourdomain.com",
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+  console.log("✓ Push notifications enabled");
+} else {
+  console.warn("⚠️  VAPID keys not found - Push notifications disabled");
+  console.warn("   Run 'npx web-push generate-vapid-keys' to generate keys");
+}
+
 // Middleware
 app.use(
   cors({
@@ -37,7 +49,7 @@ app.use(
       "https://tour-tracker-client.vercel.app",
       "http://localhost:5173",
       "https://tour-tracker-server.onrender.com",
-      "null", // Add this to allow file:// protocol
+      "null",
     ],
     credentials: true,
   })
@@ -81,6 +93,237 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+/* ----- PUSH NOTIFICATION FUNCTIONS ----- */
+
+// Function to send notification to a user
+async function sendNotificationToUser(userId, title, body, data = {}) {
+  try {
+    // Get all subscriptions for this user
+    const subscriptions = await db.query(
+      "SELECT * FROM push_subscriptions WHERE user_id = $1",
+      [userId]
+    );
+
+    const payload = JSON.stringify({
+      title,
+      body,
+      icon: "/icon-192x192.png", // You can add your app icon
+      badge: "/badge-72x72.png",
+      data,
+    });
+
+    // Send to all user's devices
+    const notifications = subscriptions.rows.map(async (sub) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: sub.endpoint,
+            keys: {
+              p256dh: sub.p256dh,
+              auth: sub.auth,
+            },
+          },
+          payload
+        );
+      } catch (error) {
+        console.error("Error sending notification:", error);
+        // If subscription is invalid, remove it
+        if (error.statusCode === 410 || error.statusCode === 404) {
+          await db.query(
+            "DELETE FROM push_subscriptions WHERE subscription_id = $1",
+            [sub.subscription_id]
+          );
+        }
+      }
+    });
+
+    await Promise.all(notifications);
+  } catch (error) {
+    console.error("Send notification error:", error);
+  }
+}
+
+// Check for upcoming tours and send notifications
+async function checkUpcomingTours() {
+  try {
+    const now = new Date();
+    
+    // Check for tours starting in 90 minutes (with 2.5 minute buffer on each side)
+    const notify90Time = new Date(now.getTime() + 90 * 60000);
+    const notify90TimeStart = new Date(now.getTime() + 87.5 * 60000); // 87.5 min
+    const notify90TimeEnd = new Date(now.getTime() + 92.5 * 60000); // 92.5 min
+
+    // Check for tours starting in 60 minutes (with 2.5 minute buffer on each side)
+    const notify60Time = new Date(now.getTime() + 60 * 60000);
+    const notify60TimeStart = new Date(now.getTime() + 57.5 * 60000); // 57.5 min
+    const notify60TimeEnd = new Date(now.getTime() + 62.5 * 60000); // 62.5 min
+
+    // Get tours for 90-minute notification
+    const tours90min = await db.query(
+      `
+      SELECT 
+        te.tour_id,
+        te.user_id,
+        te.custom_name,
+        te.start_time,
+        tt.tour_type_name,
+        ta.agency_name,
+        cs.ship_name
+      FROM tourevents te
+      LEFT JOIN tourtemplates tt ON te.template_id = tt.template_id
+      LEFT JOIN touragencies ta ON te.agency_id = ta.agency_id
+      LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
+      WHERE te.status = 'confirmed'
+      AND te.start_time BETWEEN $1 AND $2
+      `,
+      [notify90TimeStart.toISOString(), notify90TimeEnd.toISOString()]
+    );
+
+    // Get tours for 60-minute notification
+    const tours60min = await db.query(
+      `
+      SELECT 
+        te.tour_id,
+        te.user_id,
+        te.custom_name,
+        te.start_time,
+        tt.tour_type_name,
+        ta.agency_name,
+        cs.ship_name
+      FROM tourevents te
+      LEFT JOIN tourtemplates tt ON te.template_id = tt.template_id
+      LEFT JOIN touragencies ta ON te.agency_id = ta.agency_id
+      LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
+      WHERE te.status = 'confirmed'
+      AND te.start_time BETWEEN $3 AND $4
+      `,
+      [notify60TimeStart.toISOString(), notify60TimeEnd.toISOString()]
+    );
+
+    // Send 90-minute notifications
+    for (const tour of tours90min.rows) {
+      const tourName = tour.custom_name || tour.tour_type_name;
+      const title = `🔔 Tour Starting in 90 Minutes`;
+      const body = `${tourName}\nAgency: ${tour.agency_name}\nShip: ${tour.ship_name}`;
+
+      await sendNotificationToUser(tour.user_id, title, body, {
+        tourId: tour.tour_id,
+        type: "tour-reminder-90",
+        minutesUntil: 90
+      });
+      
+      console.log(`Sent 90-min notification for tour ${tour.tour_id} to user ${tour.user_id}`);
+    }
+
+    // Send 60-minute notifications
+    for (const tour of tours60min.rows) {
+      const tourName = tour.custom_name || tour.tour_type_name;
+      const title = `⏰ Tour Starting in 60 Minutes!`;
+      const body = `${tourName}\nAgency: ${tour.agency_name}\nShip: ${tour.ship_name}`;
+
+      await sendNotificationToUser(tour.user_id, title, body, {
+        tourId: tour.tour_id,
+        type: "tour-reminder-60",
+        minutesUntil: 60
+      });
+      
+      console.log(`Sent 60-min notification for tour ${tour.tour_id} to user ${tour.user_id}`);
+    }
+
+    if (tours90min.rows.length > 0 || tours60min.rows.length > 0) {
+      console.log(`Sent ${tours90min.rows.length} 90-min and ${tours60min.rows.length} 60-min notifications`);
+    }
+  } catch (error) {
+    console.error("Check upcoming tours error:", error);
+  }
+}
+
+// Run every 5 minutes to check for upcoming tours
+cron.schedule("*/5 * * * *", () => {
+  console.log("Checking for upcoming tours...");
+  checkUpcomingTours();
+}, {
+  scheduled: true,
+  timezone: "Europe/Athens" // Set your timezone
+});
+
+// Run once on startup to catch any tours we might have missed
+setTimeout(() => {
+  console.log("Running initial tour check on startup...");
+  checkUpcomingTours();
+}, 5000); // Wait 5 seconds after startup
+
+/* ----- PUSH NOTIFICATION ROUTES ----- */
+
+// Get VAPID public key
+app.get("/api/notifications/vapid-public-key", (req, res) => {
+  if (!process.env.VAPID_PUBLIC_KEY) {
+    return res.status(503).json({ 
+      error: "Push notifications not configured",
+      message: "VAPID keys are not set on the server"
+    });
+  }
+  res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
+});
+
+// Subscribe to push notifications
+app.post("/api/notifications/subscribe", authenticateToken, async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body;
+
+    if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
+      return res.status(400).json({ error: "Invalid subscription data" });
+    }
+
+    // Store subscription in database
+    await db.query(
+      `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, endpoint) DO UPDATE
+       SET p256dh = $3, auth = $4`,
+      [req.user.userId, endpoint, keys.p256dh, keys.auth]
+    );
+
+    res.json({ message: "Subscription saved successfully" });
+  } catch (error) {
+    console.error("Subscribe error:", error);
+    res.status(500).json({ error: "Failed to save subscription" });
+  }
+});
+
+// Unsubscribe from push notifications
+app.post("/api/notifications/unsubscribe", authenticateToken, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+
+    await db.query(
+      "DELETE FROM push_subscriptions WHERE user_id = $1 AND endpoint = $2",
+      [req.user.userId, endpoint]
+    );
+
+    res.json({ message: "Unsubscribed successfully" });
+  } catch (error) {
+    console.error("Unsubscribe error:", error);
+    res.status(500).json({ error: "Failed to unsubscribe" });
+  }
+});
+
+// Test notification endpoint (for testing)
+app.post("/api/notifications/test", authenticateToken, async (req, res) => {
+  try {
+    await sendNotificationToUser(
+      req.user.userId,
+      "Test Notification",
+      "This is a test notification from Tour Tracker!",
+      { type: "test" }
+    );
+    res.json({ message: "Test notification sent" });
+  } catch (error) {
+    console.error("Test notification error:", error);
+    res.status(500).json({ error: "Failed to send test notification" });
+  }
+});
 
 /* ----- AUTHENTICATION ROUTES ----- */
 
@@ -178,12 +421,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// Verify token
-app.get("/api/auth/verify", authenticateToken, (req, res) => {
-  res.json({ valid: true, user: req.user });
-});
-
-// Reset password (add this after your login route)
+// Reset password
 app.post("/api/auth/reset-password", async (req, res) => {
   try {
     const { username, newPassword } = req.body;
@@ -200,7 +438,6 @@ app.post("/api/auth/reset-password", async (req, res) => {
         .json({ error: "Password must be at least 8 characters" });
     }
 
-    // Check if user exists
     const userResult = await db.query(
       "SELECT user_id FROM users WHERE username = $1",
       [username]
@@ -210,14 +447,12 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Hash new password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
 
-    // Update password
-    await db.query("UPDATE users SET password_hash = $1 WHERE username = $2", [
-      hashedPassword,
-      username,
-    ]);
+    await db.query(
+      "UPDATE users SET password_hash = $1 WHERE username = $2",
+      [hashedPassword, username]
+    );
 
     res.json({ message: "Password reset successfully" });
   } catch (err) {
@@ -225,6 +460,12 @@ app.post("/api/auth/reset-password", async (req, res) => {
     res.status(500).json({ error: "Password reset failed" });
   }
 });
+
+// Verify token
+app.get("/api/auth/verify", authenticateToken, (req, res) => {
+  res.json({ valid: true, user: req.user });
+});
+
 /* ----- TOUREVENTS ----- */
 // GET all events - NOW FILTERED BY USER
 app.get("/api/events", authenticateToken, async (req, res) => {
@@ -242,6 +483,7 @@ app.get("/api/events", authenticateToken, async (req, res) => {
         te.agency_id,
         te.template_id,
         te.ship_id,
+        te.status,
         ta.agency_name,
         ta.agency_color_code,
         tt.tour_type_name,
@@ -259,8 +501,8 @@ app.get("/api/events", authenticateToken, async (req, res) => {
     const events = result.rows.map((event) => ({
       id: event.tour_id,
       title: event.custom_name || event.tour_type_name,
-      start: event.start_time, // This is now a simple string due to the parser override
-      end: event.end_time, // This is now a simple string due to the parser override
+      start: event.start_time,
+      end: event.end_time,
       backgroundColor: event.agency_color_code || "#3788d8",
       borderColor: event.agency_color_code || "#3788d8",
       agency: event.agency_name,
@@ -272,6 +514,7 @@ app.get("/api/events", authenticateToken, async (req, res) => {
       agencyId: event.agency_id,
       templateId: event.template_id,
       shipId: event.ship_id,
+      status: event.status,
     }));
 
     res.json(events);
@@ -284,6 +527,10 @@ app.get("/api/events", authenticateToken, async (req, res) => {
 // GET detailed tour data for reports - FILTERED BY USER
 app.get("/api/tours-detailed", authenticateToken, async (req, res) => {
   try {
+    const { includeCancelled } = req.query;
+    
+    let statusFilter = includeCancelled === 'true' ? '' : "AND te.status = 'confirmed'";
+    
     const result = await db.query(
       `
       SELECT 
@@ -296,6 +543,7 @@ app.get("/api/tours-detailed", authenticateToken, async (req, res) => {
         te.tip_eur,
         te.tip_usd,
         te.payment_status,
+        te.status,
         te.agency_id,
         te.template_id,
         te.ship_id,
@@ -308,6 +556,7 @@ app.get("/api/tours-detailed", authenticateToken, async (req, res) => {
       LEFT JOIN tourtemplates tt ON te.template_id = tt.template_id
       LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
       WHERE te.user_id = $1
+      ${statusFilter}
       ORDER BY te.tour_date, te.start_time
     `,
       [req.user.userId]
@@ -352,6 +601,7 @@ app.post("/api/mark-month-paid", authenticateToken, async (req, res) => {
        SET payment_status = $1 
        WHERE agency_id = $2 
        AND user_id = $3
+       AND status = 'confirmed'
        AND EXTRACT(MONTH FROM tour_date) = $4 
        AND EXTRACT(YEAR FROM tour_date) = $5
        RETURNING *`,
@@ -365,7 +615,7 @@ app.post("/api/mark-month-paid", authenticateToken, async (req, res) => {
   }
 });
 
-// POST new event - INCLUDES USER_ID (Original simplified logic)
+// POST new event - INCLUDES USER_ID
 app.post("/api/events", authenticateToken, async (req, res) => {
   try {
     const {
@@ -392,8 +642,8 @@ app.post("/api/events", authenticateToken, async (req, res) => {
 
     const result = await db.query(
       `INSERT INTO tourevents
-       (custom_name, tour_date, start_time, end_time, agency_id, template_id, ship_id, base_price, payment_status, tip_eur, tip_usd, user_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+       (custom_name, tour_date, start_time, end_time, agency_id, template_id, ship_id, base_price, payment_status, tip_eur, tip_usd, user_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [
         custom_name,
         tour_date,
@@ -407,6 +657,7 @@ app.post("/api/events", authenticateToken, async (req, res) => {
         tip_eur,
         tip_usd,
         req.user.userId,
+        'confirmed'
       ]
     );
 
@@ -422,7 +673,6 @@ app.put("/api/events/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1. Verification of ownership
     const checkResult = await db.query(
       "SELECT user_id FROM tourevents WHERE tour_id = $1",
       [id]
@@ -432,9 +682,6 @@ app.put("/api/events/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Tour not found" });
     }
 
-    // IMPORTANT: Check if the user_id is the same type (number vs string)
-    // The JWT stores user_id as a number, but req.user.userId is a string.
-    // Ensure strict type checking is avoided or conversion is used (e.g., toString()).
     if (checkResult.rows[0].user_id.toString() !== req.user.userId.toString()) {
       return res.status(403).json({ error: "Access denied" });
     }
@@ -476,6 +723,150 @@ app.put("/api/events/:id", authenticateToken, async (req, res) => {
   } catch (err) {
     console.error("PUT Event error:", err);
     res.status(500).json({ error: "PUT Event error" });
+  }
+});
+
+// Cancel a tour (instead of deleting)
+app.patch("/api/events/:id/cancel", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const checkResult = await db.query(
+      "SELECT user_id FROM tourevents WHERE tour_id = $1",
+      [id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: "Tour not found" });
+    }
+
+    if (checkResult.rows[0].user_id.toString() !== req.user.userId.toString()) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const result = await db.query(
+      `UPDATE tourevents 
+       SET status = 'cancelled'
+       WHERE tour_id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Cancel tour error:", err);
+    res.status(500).json({ error: "Failed to cancel tour" });
+  }
+});
+
+// Restore a cancelled tour
+app.patch("/api/events/:id/restore", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const checkResult = await db.query(
+      "SELECT user_id FROM tourevents WHERE tour_id = $1",
+      [id]
+    );
+
+    if (checkResult.rows.length === 0) {
+      return res.status(404).json({ error: "Tour not found" });
+    }
+
+    if (checkResult.rows[0].user_id.toString() !== req.user.userId.toString()) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const result = await db.query(
+      `UPDATE tourevents 
+       SET status = 'confirmed'
+       WHERE tour_id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Restore tour error:", err);
+    res.status(500).json({ error: "Failed to restore tour" });
+  }
+});
+
+// Get cancellation statistics
+app.get("/api/cancellation-stats", authenticateToken, async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    let dateFilter = "";
+    const params = [req.user.userId];
+    
+    if (startDate && endDate) {
+      dateFilter = "AND te.tour_date BETWEEN $2 AND $3";
+      params.push(startDate, endDate);
+    }
+
+    const agencyStats = await db.query(
+      `
+      SELECT 
+        ta.agency_name,
+        ta.agency_color_code,
+        COUNT(*) as cancelled_count,
+        COALESCE(SUM(te.base_price), 0) as lost_base_amount,
+        COALESCE(SUM(te.tip_eur), 0) as lost_tip_eur,
+        COALESCE(SUM(te.tip_usd), 0) as lost_tip_usd
+      FROM tourevents te
+      LEFT JOIN touragencies ta ON te.agency_id = ta.agency_id
+      WHERE te.user_id = $1 
+      AND te.status = 'cancelled'
+      ${dateFilter}
+      GROUP BY ta.agency_id, ta.agency_name, ta.agency_color_code
+      ORDER BY cancelled_count DESC
+      `,
+      params
+    );
+
+    const shipStats = await db.query(
+      `
+      SELECT 
+        cs.ship_name,
+        COUNT(*) as cancelled_count,
+        COALESCE(SUM(te.base_price), 0) as lost_base_amount,
+        COALESCE(SUM(te.tip_eur), 0) as lost_tip_eur,
+        COALESCE(SUM(te.tip_usd), 0) as lost_tip_usd
+      FROM tourevents te
+      LEFT JOIN cruiseships cs ON te.ship_id = cs.ship_id
+      WHERE te.user_id = $1 
+      AND te.status = 'cancelled'
+      ${dateFilter}
+      GROUP BY cs.ship_id, cs.ship_name
+      ORDER BY cancelled_count DESC
+      `,
+      params
+    );
+
+    const totals = await db.query(
+      `
+      SELECT 
+        COUNT(*) as total_cancelled,
+        COALESCE(SUM(base_price), 0) as total_lost_base,
+        COALESCE(SUM(tip_eur), 0) as total_lost_tip_eur,
+        COALESCE(SUM(tip_usd), 0) as total_lost_tip_usd
+      FROM tourevents
+      WHERE user_id = $1 
+      AND status = 'cancelled'
+      ${dateFilter}
+      `,
+      params
+    );
+
+    res.json({
+      byAgency: agencyStats.rows,
+      byShip: shipStats.rows,
+      totals: totals.rows[0]
+    });
+  } catch (err) {
+    console.error("Cancellation stats error:", err);
+    res.status(500).json({ error: "Failed to get cancellation stats" });
   }
 });
 
@@ -803,4 +1194,5 @@ app.delete("/api/cruiseships/:id", authenticateToken, async (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+  console.log("Push notification cron job started - checking every 5 minutes");
 });
